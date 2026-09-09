@@ -1,0 +1,15 @@
+.env
+venv/
+__pycache__/
+*.db
+*.backup*
+*.felbackup*
+*.pyc
+recovered/
+
+# Gamla backup- och testfiler
+*_backup*
+*.backup*
+*test*
+facebook_test.html
+kommentarer.json
