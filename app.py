@@ -1,87 +1,26 @@
-from flask import Flask, request, redirect, url_for, session
+from flask import Flask, request, redirect, url_for
 import sqlite3
+import os
+import shutil
 from datetime import datetime
 from html import escape
-import re
-import secrets
-import os
-from functools import wraps
 
 app = Flask(__name__)
 
 DB = "dif_hockey.db"
-
-
-# ============================================================
-# ADMIN / MILJÖINSTÄLLNINGAR
-# ============================================================
-
-def load_local_env():
-    """Läser enkla KEY=VALUE-inställningar från projektets .env."""
-    env_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        ".env"
-    )
-
-    if not os.path.exists(env_path):
-        return
-
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-
-                if (
-                    len(value) >= 2
-                    and value[0] == value[-1]
-                    and value[0] in ('"', "'")
-                ):
-                    value = value[1:-1]
-
-                os.environ.setdefault(key, value)
-    except OSError:
-        pass
-
-
-load_local_env()
-
-ADMIN_PASSWORD = os.environ.get("SOFF_ADMIN_PASSWORD", "")
-SECRET_KEY = os.environ.get("SOFF_SECRET_KEY", "")
-
-if not ADMIN_PASSWORD or not SECRET_KEY:
-    raise RuntimeError(
-        "SOFF_ADMIN_PASSWORD och SOFF_SECRET_KEY måste finnas i .env"
-    )
-
-app.secret_key = SECRET_KEY
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-
-
-def admin_required(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if not session.get("admin_logged_in"):
-            next_url = request.full_path
-            if next_url.endswith("?"):
-                next_url = next_url[:-1]
-            return redirect(
-                url_for("admin_login", next=next_url)
-            )
-        return view(*args, **kwargs)
-
-    return wrapped
+SEED_DB = "render_seed.sqlite"
 
 
 # ============================================================
 # DATABASE
 # ============================================================
+
+def ensure_database():
+    if not os.path.exists(DB) and os.path.exists(SEED_DB):
+        shutil.copyfile(SEED_DB, DB)
+
+
+ensure_database()
 
 def get_db():
     conn = sqlite3.connect(DB)
@@ -102,8 +41,7 @@ def setup_forum():
             title TEXT NOT NULL,
             username TEXT NOT NULL,
             message TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            edit_token TEXT
+            created_at TEXT NOT NULL
         )
     """)
 
@@ -113,168 +51,15 @@ def setup_forum():
             thread_id INTEGER NOT NULL,
             username TEXT NOT NULL,
             message TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            edit_token TEXT
+            created_at TEXT NOT NULL
         )
     """)
-
-    for table in ("forum_threads", "forum_replies"):
-        columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-        if "edit_token" not in columns:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN edit_token TEXT")
 
     conn.commit()
     conn.close()
 
 
 setup_forum()
-
-
-def is_admin():
-    return bool(session.get("admin_logged_in"))
-
-
-def can_manage_forum_item(row):
-    if is_admin():
-        return True
-
-    saved = row["edit_token"] or ""
-    if not saved:
-        return False
-
-    tokens = session.get("forum_tokens", {})
-    token = (
-        tokens.get(f"forum_thread:{row['id']}", "")
-        or tokens.get(f"forum_reply:{row['id']}", "")
-        or tokens.get(str(row['id']), "")
-    )
-
-    if token and secrets.compare_digest(token, saved):
-        return True
-
-    # Behåll stöd för den äldre cookie-lösningen så befintliga inlägg
-    # inte plötsligt tappar sin ägarskapstoken.
-    legacy_token = request.cookies.get("forum_author_token", "")
-    return bool(
-        legacy_token
-        and secrets.compare_digest(legacy_token, saved)
-    )
-
-
-def remember_forum_token(item_type, item_id, token):
-    tokens = dict(session.get("forum_tokens", {}))
-    tokens[f"{item_type}:{item_id}"] = token
-    session["forum_tokens"] = tokens
-    session.modified = True
-
-
-def set_forum_token(response, token):
-    response.set_cookie(
-        "forum_author_token",
-        token,
-        httponly=True,
-        samesite="Lax",
-        max_age=60 * 60 * 24 * 365 * 2
-    )
-    return response
-
-
-# ============================================================
-# SOFFEXPERT-SYSTEM – HJÄLPFUNKTIONER
-# ============================================================
-
-MIN_CLAIMS_FOR_RANKING = 3
-
-
-def season_from_date(value):
-    if not value:
-        now = datetime.now()
-        start_year = now.year if now.month >= 8 else now.year - 1
-        return f"{start_year}/{str(start_year + 1)[-2:]}"
-
-    text_value = str(value)
-
-    match = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", text_value)
-    if match:
-        year = int(match.group(1))
-        month = int(match.group(2))
-        start_year = year if month >= 8 else year - 1
-        return f"{start_year}/{str(start_year + 1)[-2:]}"
-
-    match = re.search(r"(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})", text_value)
-    if match:
-        first = int(match.group(1))
-        second = int(match.group(2))
-        year = int(match.group(3))
-        month = second if first > 12 else first
-        start_year = year if month >= 8 else year - 1
-        return f"{start_year}/{str(start_year + 1)[-2:]}"
-
-    return season_from_date(None)
-
-
-def claim_tag(claim_type, claim_text=""):
-    value = f"{claim_type or ''} {claim_text or ''}".casefold()
-
-    groups = [
-        ("#transfer", ["värvar", "värva", "värvning", "nyförvärv", "transfer", "kontrakt", "signar", "signering"]),
-        ("#målvakt", ["målvakt", "målvakten", "keeper", "målvakter"]),
-        ("#tränare", ["tränare", "coach", "tränarn", "ledare"]),
-        ("#tabellplacering", ["tabell", "slutspel", "kval", "placering", "etta", "tvåa", "trea", "sist"]),
-        ("#mål/poäng", ["mål", "målgörare", "målskytt", "poäng", "assist"]),
-        ("#kedja", ["kedja", "formation", "femma", "backpar"]),
-        ("#spelare", ["spelare", "floppar", "levererar"]),
-    ]
-
-    for tag, words in groups:
-        if any(word in value for word in words):
-            return tag
-
-    return "#övrigt"
-
-
-def ranking_stats(rows):
-    result = {}
-
-    for row in rows:
-        name = row["commenter"] or "Okänd soffexpert"
-        verdict = row["verdict"] or "OKLART"
-
-        if name not in result:
-            result[name] = {"claims": 0, "right": 0, "wrong": 0, "points": 0}
-
-        if verdict not in ("RÄTT", "FEL"):
-            continue
-
-        result[name]["claims"] += 1
-
-        if verdict == "RÄTT":
-            result[name]["right"] += 1
-            result[name]["points"] += 1
-        else:
-            result[name]["wrong"] += 1
-
-    ranked = []
-
-    for name, stats in result.items():
-        if stats["claims"] < MIN_CLAIMS_FOR_RANKING:
-            continue
-
-        stats["name"] = name
-        stats["percentage"] = round(stats["right"] / stats["claims"] * 100)
-        ranked.append(stats)
-
-    ranked.sort(
-        key=lambda item: (
-            -item["percentage"],
-            -item["right"],
-            item["wrong"],
-            -item["claims"],
-            item["name"].casefold()
-        )
-    )
-
-    return ranked
 
 
 # ============================================================
@@ -288,83 +73,67 @@ def page(title, content):
         box-sizing: border-box;
     }
 
-    html {
-        scroll-behavior: smooth;
-    }
-
     body {
         margin: 0;
-        background:
-            radial-gradient(circle at 50% -20%, #242930 0, #15181c 34%, #0d0f11 78%);
-        color: #e9edf1;
+        background: #101214;
+        color: #e7e9eb;
         font-family: Arial, Helvetica, sans-serif;
-        line-height: 1.65;
-        min-height: 100vh;
+        line-height: 1.6;
     }
 
     header {
-        background: rgba(18, 21, 24, 0.96);
-        border-bottom: 1px solid #353a40;
-        padding: 12px 20px;
-        position: sticky;
-        top: 0;
-        z-index: 100;
-        backdrop-filter: blur(10px);
+        background: #17191c;
+        border-bottom: 1px solid #30343a;
+        padding: 14px 20px;
     }
 
     .header-inner {
-        max-width: 1180px;
+        max-width: 1150px;
         margin: auto;
         display: flex;
         align-items: center;
-        gap: 30px;
+        gap: 28px;
     }
 
     .logo {
-        height: 62px;
+        height: 68px;
         width: auto;
         object-fit: contain;
-        flex: 0 0 auto;
     }
 
     nav {
         display: flex;
         flex-wrap: wrap;
-        gap: 4px;
-        align-items: center;
+        gap: 6px;
     }
 
     nav a {
-        color: #cfd5da;
+        color: #d9dde1;
         text-decoration: none;
-        padding: 9px 12px;
-        border-radius: 8px;
+        padding: 9px 13px;
+        border-radius: 6px;
         font-size: 14px;
-        transition: background 0.15s ease, color 0.15s ease;
     }
 
     nav a:hover {
-        background: #292e34;
-        color: #ffffff;
+        background: #292d32;
     }
 
     main {
-        max-width: 1180px;
-        margin: 42px auto;
-        padding: 0 20px;
+        max-width: 1150px;
+        margin: 35px auto;
+        padding: 0 18px;
     }
 
     h1 {
-        font-size: clamp(30px, 4vw, 42px);
-        line-height: 1.15;
+        font-size: 36px;
+        line-height: 1.2;
         margin: 0 0 10px;
-        letter-spacing: -0.6px;
     }
 
     h2 {
         line-height: 1.3;
         margin-top: 0;
-        letter-spacing: -0.2px;
     }
 
     h3 {
@@ -372,50 +141,42 @@ def page(title, content):
     }
 
     a {
-        color: #c2d0dc;
-        transition: color 0.15s ease;
-    }
-
-    a:hover {
-        color: #ffffff;
+        color: #b8c8d8;
     }
 
     .subtitle {
-        color: #929aa3;
+        color: #9ca3aa;
         margin-bottom: 28px;
     }
 
     .hero {
-        background:
-            linear-gradient(145deg, rgba(31, 35, 40, 0.98), rgba(21, 24, 28, 0.98));
-        border: 1px solid #3a4047;
-        border-radius: 18px;
-        padding: 48px 38px;
+        background: #181b1f;
+        border: 1px solid #343940;
+        border-radius: 14px;
+        padding: 42px 35px;
         text-align: center;
-        margin-bottom: 28px;
-        box-shadow: 0 18px 45px rgba(0, 0, 0, 0.24);
+        margin-bottom: 24px;
     }
 
     .hero-logo {
         max-width: 260px;
         width: 42%;
         height: auto;
-        margin: 0 auto 22px;
+        margin: 0 auto 20px;
         display: block;
-        filter: drop-shadow(0 8px 18px rgba(0, 0, 0, 0.28));
     }
 
     .hero-tagline {
-        font-size: 25px;
+        font-size: 24px;
         font-weight: bold;
-        letter-spacing: 0.3px;
-        margin-bottom: 20px;
+        letter-spacing: 0.4px;
+        margin-bottom: 18px;
     }
 
     .hero-intro {
         max-width: 760px;
         margin: auto;
-        color: #c5cbd1;
+        color: #c5c9ce;
         font-size: 17px;
         text-align: left;
     }
@@ -429,80 +190,69 @@ def page(title, content):
         justify-content: center;
         flex-wrap: wrap;
         gap: 10px;
-        margin-top: 28px;
+        margin-top: 25px;
     }
 
     .button {
         display: inline-block;
-        background: linear-gradient(180deg, #3b4148, #30353b);
+        background: #343a40;
         color: #ffffff;
-        border: 1px solid #515860;
-        border-radius: 9px;
+        border: 1px solid #4b5259;
+        border-radius: 7px;
         padding: 10px 17px;
         text-decoration: none;
-        font-weight: 600;
-        transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease;
     }
 
     .button:hover {
-        background: linear-gradient(180deg, #484f57, #383e45);
+        background: #454c53;
         color: white;
-        border-color: #666e77;
-        transform: translateY(-1px);
     }
 
     .section-title {
-        margin: 38px 0 15px;
-        font-size: 25px;
+        margin: 34px 0 14px;
+        font-size: 24px;
     }
 
     .grid {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 20px;
+        gap: 18px;
     }
 
     .grid-three {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 20px;
+        gap: 18px;
     }
 
     .card {
-        background: linear-gradient(145deg, #1a1e23, #16191d);
-        border: 1px solid #32383f;
-        border-radius: 13px;
-        padding: 21px;
-        margin-bottom: 20px;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
-    }
-
-    .card:hover {
-        border-color: #414850;
+        background: #191c20;
+        border: 1px solid #30353b;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 18px;
     }
 
     .stat {
         text-align: center;
-        padding: 24px 18px;
     }
 
     .stat-number {
         display: block;
-        font-size: 34px;
+        font-size: 31px;
         font-weight: bold;
         margin-bottom: 3px;
-        letter-spacing: -0.5px;
     }
 
     .stat-label {
-        color: #929aa3;
-        font-size: 12px;
+        color: #969da5;
+        font-size: 13px;
         text-transform: uppercase;
-        letter-spacing: 0.8px;
+        letter-spacing: 0.5px;
     }
 
     .claim {
-        border-left: 4px solid #68717a;
+        border-left: 4px solid #626b75;
     }
 
     .right {
@@ -519,11 +269,10 @@ def page(title, content):
 
     .badge {
         display: inline-block;
-        padding: 5px 10px;
-        border-radius: 999px;
-        font-size: 12px;
+        padding: 5px 9px;
+        border-radius: 5px;
+        font-size: 13px;
         font-weight: bold;
-        letter-spacing: 0.3px;
     }
 
     .badge-right {
@@ -551,7 +300,7 @@ def page(title, content):
         align-items: center;
         justify-content: space-between;
         gap: 15px;
-        padding: 13px 0;
+        padding: 12px 0;
         border-bottom: 1px solid #30343a;
     }
 
@@ -570,7 +319,7 @@ def page(title, content):
     }
 
     .claim-mini {
-        padding: 15px 0;
+        padding: 14px 0;
         border-bottom: 1px solid #30343a;
     }
 
@@ -581,7 +330,6 @@ def page(title, content):
     .claim-mini-text {
         font-size: 16px;
         font-weight: bold;
-        margin: 6px 0;
     }
 
     .meta {
@@ -590,11 +338,14 @@ def page(title, content):
     }
 
     .comment {
-        background: #131619;
-        border: 1px solid #292e33;
-        border-radius: 9px;
+        background: #151719;
+        border-radius: 7px;
         padding: 15px;
         margin-top: 10px;
+    }
+
+    .hall-card {
+        min-height: 190px;
     }
 
     .how-step {
@@ -602,7 +353,7 @@ def page(title, content):
     }
 
     .how-number {
-        font-size: 29px;
+        font-size: 28px;
         font-weight: bold;
         margin-bottom: 8px;
     }
@@ -615,33 +366,25 @@ def page(title, content):
     th,
     td {
         text-align: left;
-        padding: 13px 12px;
+        padding: 12px;
         border-bottom: 1px solid #303438;
     }
 
     th {
         color: #aeb5bc;
-        font-size: 13px;
-        text-transform: uppercase;
-        letter-spacing: 0.35px;
-    }
-
-    tr:last-child td {
-        border-bottom: 0;
     }
 
     button {
-        background: linear-gradient(180deg, #3b4148, #30353b);
+        background: #343a40;
         color: white;
-        border: 1px solid #515860;
-        border-radius: 9px;
+        border: 1px solid #4b5259;
+        border-radius: 6px;
         padding: 10px 16px;
         cursor: pointer;
-        font-weight: 600;
     }
 
     button:hover {
-        background: linear-gradient(180deg, #484f57, #383e45);
+        background: #454c53;
     }
 
     button.danger {
@@ -659,25 +402,15 @@ def page(title, content):
     }
 
     input,
-    textarea,
-    select {
+    textarea {
         width: 100%;
-        background: #101316;
+        background: #111315;
         color: white;
-        border: 1px solid #3a4148;
-        border-radius: 8px;
-        padding: 11px 12px;
+        border: 1px solid #3a3f44;
+        border-radius: 6px;
+        padding: 11px;
         margin-top: 6px;
         margin-bottom: 15px;
-        font: inherit;
-    }
-
-    input:focus,
-    textarea:focus,
-    select:focus {
-        outline: none;
-        border-color: #68727c;
-        box-shadow: 0 0 0 3px rgba(104, 114, 124, 0.14);
     }
 
     textarea {
@@ -697,16 +430,16 @@ def page(title, content):
     }
 
     footer {
-        max-width: 1180px;
-        margin: 55px auto 30px;
-        padding: 22px 20px;
+        max-width: 1150px;
+        margin: 50px auto;
+        padding: 20px 18px;
         border-top: 1px solid #303438;
         color: #777f87;
         font-size: 13px;
-        text-align: center;
     }
 
     @media (max-width: 800px) {
+
         .grid,
         .grid-three {
             grid-template-columns: 1fr;
@@ -714,40 +447,18 @@ def page(title, content):
 
         .header-inner {
             flex-direction: column;
-            align-items: center;
-            gap: 12px;
-        }
-
-        nav {
-            justify-content: center;
+            align-items: flex-start;
         }
 
         .hero {
-            padding: 34px 22px;
-        }
-
-        .hero-logo {
-            width: 55%;
+            padding: 30px 20px;
         }
     }
 
     @media (max-width: 500px) {
-        header {
-            padding: 10px 12px;
-        }
 
         .logo {
-            height: 54px;
-        }
-
-        nav a {
-            padding: 8px 9px;
-            font-size: 13px;
-        }
-
-        main {
-            margin: 28px auto;
-            padding: 0 13px;
+            height: 58px;
         }
 
         h1 {
@@ -761,22 +472,7 @@ def page(title, content):
         .hero-intro {
             font-size: 16px;
         }
-
-        .hero-logo {
-            width: 68%;
-        }
-
-        .card {
-            padding: 17px;
-        }
-
-        table {
-            display: block;
-            overflow-x: auto;
-            white-space: nowrap;
-        }
     }
-
     """
 
     return """
@@ -815,11 +511,9 @@ def page(title, content):
 <a href="/">Hem</a>
 <a href="/claims">Påståenden</a>
 <a href="/experter">Soffexperter</a>
-<a href="/ranking">Ranking</a>
 <a href="/forum">Forum</a>
 <a href="/ideer">Idélådan</a>
 <a href="/om">Om sidan</a>
-<a href="/admin">Admin</a>
 
 </nav>
 
@@ -839,202 +533,6 @@ SOFFEXPERTERNA – Vi minns vad du sa.
 
 </html>
 """
-
-
-# ============================================================
-# ADMININLOGGNING
-# ============================================================
-
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-
-    if session.get("admin_logged_in"):
-        return redirect(url_for("admin"))
-
-    error = ""
-    next_url = request.args.get("next", "")
-
-    if request.method == "POST":
-
-        password = request.form.get("password", "")
-        next_url = request.form.get("next", "")
-
-        if secrets.compare_digest(password, ADMIN_PASSWORD):
-            forum_tokens = session.get("forum_tokens", {})
-            session.clear()
-            session["forum_tokens"] = forum_tokens
-            session["admin_logged_in"] = True
-
-            if next_url.startswith("/") and not next_url.startswith("//"):
-                return redirect(next_url)
-
-            return redirect(url_for("admin"))
-
-        error = "Fel lösenord."
-
-    error_html = ""
-    if error:
-        error_html = f'<p class="error">{escape(error)}</p>'
-
-    content = f"""
-<h1>Admin</h1>
-
-<div class="card">
-
-<h2>Logga in</h2>
-
-{error_html}
-
-<form method="POST">
-
-<input type="hidden" name="next" value="{escape(next_url)}">
-
-<label>Adminlösenord</label>
-
-<input
-    type="password"
-    name="password"
-    autocomplete="current-password"
-    required
->
-
-<button type="submit">Logga in</button>
-
-</form>
-
-</div>
-"""
-
-    return page("Admin", content)
-
-
-@app.route("/admin/logout")
-def admin_logout():
-    session.clear()
-    return redirect(url_for("index"))
-
-
-@app.route("/admin")
-@admin_required
-def admin():
-
-    conn = get_db()
-
-    claims_total = conn.execute(
-        "SELECT COUNT(*) FROM claims"
-    ).fetchone()[0]
-
-    claims_decided = conn.execute(
-        "SELECT COUNT(*) FROM claims WHERE verdict IN ('RÄTT', 'FEL')"
-    ).fetchone()[0]
-
-    threads_total = conn.execute(
-        "SELECT COUNT(*) FROM forum_threads"
-    ).fetchone()[0]
-
-    replies_total = conn.execute(
-        "SELECT COUNT(*) FROM forum_replies"
-    ).fetchone()[0]
-
-    conn.close()
-
-    content = f"""
-<h1>Adminpanel</h1>
-
-<p class="subtitle">
-Här samlas funktioner som bara administratören ska kunna använda.
-</p>
-
-<div class="grid">
-
-<div class="card">
-<h2>Påståenden</h2>
-<p>Totalt: <strong>{claims_total}</strong></p>
-<p>Avgjorda: <strong>{claims_decided}</strong></p>
-<a href="/claims">Visa påståenden</a>
-</div>
-
-<div class="card">
-<h2>Forum</h2>
-<p>Trådar: <strong>{threads_total}</strong></p>
-<p>Svar: <strong>{replies_total}</strong></p>
-<a href="/forum">Öppna forumet</a>
-</div>
-
-</div>
-
-<div class="card">
-<h2>Administration</h2>
-<p>
-Admininloggningen skyddar framtida funktioner för moderering,
-facit och underhåll. Vanliga användare påverkas inte av detta.
-</p>
-
-<a href="/admin/logout">Logga ut</a>
-</div>
-"""
-
-    return page("Adminpanel", content)
-
-
-# ============================================================
-# ADMIN – TA BORT FORUMTRÅD
-# ============================================================
-
-@app.route("/admin/forum/<int:thread_id>/delete", methods=["POST"])
-@admin_required
-def admin_delete_thread(thread_id):
-
-    conn = get_db()
-
-    conn.execute(
-        "DELETE FROM forum_replies WHERE thread_id = ?",
-        (thread_id,)
-    )
-
-    conn.execute(
-        "DELETE FROM forum_threads WHERE id = ?",
-        (thread_id,)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return redirect(url_for("forum"))
-
-
-# ============================================================
-# ADMIN – TA BORT FORUMSVAR
-# ============================================================
-
-@app.route("/admin/forum/reply/<int:reply_id>/delete", methods=["POST"])
-@admin_required
-def admin_delete_reply(reply_id):
-
-    conn = get_db()
-
-    reply = conn.execute(
-        "SELECT thread_id FROM forum_replies WHERE id = ?",
-        (reply_id,)
-    ).fetchone()
-
-    if reply is not None:
-        thread_id = reply["thread_id"]
-
-        conn.execute(
-            "DELETE FROM forum_replies WHERE id = ?",
-            (reply_id,)
-        )
-
-        conn.commit()
-        conn.close()
-
-        return redirect(
-            url_for("forum_thread", thread_id=thread_id)
-        )
-
-    conn.close()
-    return redirect(url_for("forum"))
 
 
 # ============================================================
@@ -1082,8 +580,7 @@ def index():
     latest_claims = conn.execute("""
         SELECT
             c.*,
-            co.commenter,
-            co.facebook_time AS source_time
+            co.commenter
         FROM claims c
         LEFT JOIN comments co
             ON c.comment_id = co.id
@@ -1142,6 +639,36 @@ def index():
         LIMIT 1
     """).fetchone()
 
+    hall_fame = conn.execute("""
+        SELECT
+            commenter,
+            COUNT(*) AS right_count
+        FROM comments
+        JOIN claims
+            ON claims.comment_id = comments.id
+        WHERE commenter IS NOT NULL
+          AND commenter != ''
+          AND claims.verdict = 'RÄTT'
+        GROUP BY commenter
+        ORDER BY right_count DESC
+        LIMIT 5
+    """).fetchall()
+
+    hall_shame = conn.execute("""
+        SELECT
+            commenter,
+            COUNT(*) AS wrong_count
+        FROM comments
+        JOIN claims
+            ON claims.comment_id = comments.id
+        WHERE commenter IS NOT NULL
+          AND commenter != ''
+          AND claims.verdict = 'FEL'
+        GROUP BY commenter
+        ORDER BY wrong_count DESC
+        LIMIT 5
+    """).fetchall()
+
     conn.close()
 
     # --------------------------------------------------------
@@ -1183,12 +710,12 @@ def index():
                 </div>
 
                 <div class="claim-mini-text">
-                    """ + escape(row['claim_text']) + """
+                    """ + escape(row["claim_text"]) + """
                 </div>
 
                 <div class="meta">
                     """ + escape(commenter) + """
-                    · Påstående #""" + str(row['id']) + """
+                    · Påstående #""" + str(row["id"]) + """
                 </div>
 
             </div>
@@ -1273,6 +800,80 @@ def index():
         Ingen aktivitet ännu.
         </p>
         """
+
+    # --------------------------------------------------------
+    # HALL OF FAME
+    # --------------------------------------------------------
+
+    fame_html = ""
+
+    if not hall_fame:
+
+        fame_html = """
+        <p class="meta">
+        Ingen har fått RÄTT ännu.
+        </p>
+        """
+
+    else:
+
+        for row in hall_fame:
+
+            fame_html += """
+            <div class="expert-row">
+
+                <div>
+                    <a href=\"""" + url_for(
+                        "expert",
+                        name=row["commenter"]
+                    ) + """\">
+                        """ + escape(row["commenter"]) + """
+                    </a>
+                </div>
+
+                <div class="expert-stat">
+                    """ + str(row["right_count"]) + """ RÄTT
+                </div>
+
+            </div>
+            """
+
+    # --------------------------------------------------------
+    # HALL OF SHAME
+    # --------------------------------------------------------
+
+    shame_html = ""
+
+    if not hall_shame:
+
+        shame_html = """
+        <p class="meta">
+        Ingen har fått FEL ännu.
+        </p>
+        """
+
+    else:
+
+        for row in hall_shame:
+
+            shame_html += """
+            <div class="expert-row">
+
+                <div>
+                    <a href=\"""" + url_for(
+                        "expert",
+                        name=row["commenter"]
+                    ) + """\">
+                        """ + escape(row["commenter"]) + """
+                    </a>
+                </div>
+
+                <div class="expert-stat">
+                    """ + str(row["wrong_count"]) + """ FEL
+                </div>
+
+            </div>
+            """
 
     # --------------------------------------------------------
     # HEMSIDAN
@@ -1480,6 +1081,44 @@ def index():
 
 
     <h2 class="section-title">
+        Hall of Fame & Hall of Shame
+    </h2>
+
+    <div class="grid">
+
+        <div class="card hall-card">
+
+            <h2>
+                Hall of Fame
+            </h2>
+
+            <p class="meta">
+                De som faktiskt fick rätt.
+            </p>
+
+            """ + fame_html + """
+
+        </div>
+
+
+        <div class="card hall-card">
+
+            <h2>
+                Hall of Shame
+            </h2>
+
+            <p class="meta">
+                De mest minnesvärda felaktiga påståendena.
+            </p>
+
+            """ + shame_html + """
+
+        </div>
+
+    </div>
+
+
+    <h2 class="section-title">
         Så fungerar SOFFEXPERTERNA
     </h2>
 
@@ -1557,8 +1196,7 @@ def claims():
     rows = conn.execute("""
         SELECT
             c.*,
-            co.commenter,
-            co.facebook_time AS source_time
+            co.commenter
         FROM claims c
         LEFT JOIN comments co
             ON c.comment_id = co.id
@@ -1569,28 +1207,9 @@ def claims():
 
     query = request.args.get("q", "").strip()
     status = request.args.get("status", "ALL").strip().upper()
-    season = request.args.get("season", "ALL").strip()
-    tag = request.args.get("tag", "ALL").strip()
-
-    try:
-        current_page = int(request.args.get("page", "1"))
-    except (TypeError, ValueError):
-        current_page = 1
-
-    if current_page < 1:
-        current_page = 1
 
     if status not in {"ALL", "RÄTT", "FEL", "OKLART"}:
         status = "ALL"
-
-    available_seasons = sorted(
-        {season_from_date(row["source_time"]) for row in rows},
-        reverse=True
-    )
-
-    available_tags = sorted(
-        {claim_tag("", row['claim_text']) for row in rows}
-    )
 
     filtered_rows = []
     query_lower = query.casefold()
@@ -1598,17 +1217,9 @@ def claims():
     for row in rows:
         verdict = row["verdict"] or "OKLART"
         commenter = row["commenter"] or "Okänd soffexpert"
-        claim_text = row['claim_text'] or ""
-        row_season = season_from_date(row["source_time"])
-        row_tag = claim_tag("", claim_text)
+        claim_text = row["claim_text"] or ""
 
         if status != "ALL" and verdict != status:
-            continue
-
-        if season != "ALL" and row_season != season:
-            continue
-
-        if tag != "ALL" and row_tag != tag:
             continue
 
         if query_lower:
@@ -1618,34 +1229,11 @@ def claims():
 
         filtered_rows.append(row)
 
-    claims_per_page = 20
-    total_filtered = len(filtered_rows)
-    total_pages = max(1, (total_filtered + claims_per_page - 1) // claims_per_page)
-
-    if current_page > total_pages:
-        current_page = total_pages
-
-    start_index = (current_page - 1) * claims_per_page
-    end_index = start_index + claims_per_page
-    page_rows = filtered_rows[start_index:end_index]
-
     selected_all = " selected" if status == "ALL" else ""
     selected_right = " selected" if status == "RÄTT" else ""
     selected_wrong = " selected" if status == "FEL" else ""
     selected_unknown = " selected" if status == "OKLART" else ""
     search_value = escape(query, quote=True)
-
-    filter_params = {
-        "q": query,
-        "status": status,
-        "season": season,
-        "tag": tag
-    }
-
-    def page_url(page_number):
-        params = dict(filter_params)
-        params["page"] = page_number
-        return url_for("claims", **params)
 
     html = f"""
 <h1>Påståenden</h1>
@@ -1679,18 +1267,6 @@ Vi minns vad du sa.
     <option value="OKLART"{selected_unknown}>OKLART</option>
 </select>
 
-<label for="claim-season" style="display:block; margin-top:15px;"><strong>Säsong</strong></label>
-<select id="claim-season" name="season" style="width:100%; box-sizing:border-box; margin-top:8px; padding:10px; border-radius:8px; border:1px solid #444; background:#181818; color:#fff;">
-    <option value="ALL">Alla säsonger</option>
-    {"".join(f'<option value="{escape(s)}"{" selected" if season == s else ""}>{escape(s)}</option>' for s in available_seasons)}
-</select>
-
-<label for="claim-tag" style="display:block; margin-top:15px;"><strong>Tagg</strong></label>
-<select id="claim-tag" name="tag" style="width:100%; box-sizing:border-box; margin-top:8px; padding:10px; border-radius:8px; border:1px solid #444; background:#181818; color:#fff;">
-    <option value="ALL">Alla taggar</option>
-    {"".join(f'<option value="{escape(t)}"{" selected" if tag == t else ""}>{escape(t)}</option>' for t in available_tags)}
-</select>
-
 <div style="margin-top:15px; display:flex; gap:10px; flex-wrap:wrap;">
     <button type="submit" class="button">Filtrera</button>
     <a href="{url_for('claims')}" class="button">Rensa</a>
@@ -1700,35 +1276,35 @@ Vi minns vad du sa.
 </div>
 
 <div class="meta" style="margin:18px 0;">
-Visar {start_index + 1 if total_filtered else 0}–{min(end_index, total_filtered)} av {total_filtered} påståenden.
+Visar {len(filtered_rows)} av {len(rows)} påståenden.
 </div>
 """
 
-    if not page_rows:
+    if not filtered_rows:
         html += """
 <div class="card">
 <p>Inga påståenden matchar din sökning.</p>
 </div>
 """
-    else:
-        for row in page_rows:
-            verdict = row["verdict"] or "OKLART"
 
-            if verdict == "RÄTT":
-                badge = '<span class="badge badge-right">RÄTT</span>'
-                cls = "right"
-            elif verdict == "FEL":
-                badge = '<span class="badge badge-wrong">FEL</span>'
-                cls = "wrong"
-            else:
-                badge = '<span class="badge badge-unknown">OKLART</span>'
-                cls = "unknown"
+    for row in filtered_rows:
+        verdict = row["verdict"] or "OKLART"
 
-            commenter = row["commenter"] or "Okänd soffexpert"
-            claim_text = row['claim_text'] or ""
-            evidence = row['evidence'] or ""
+        if verdict == "RÄTT":
+            badge = '<span class="badge badge-right">RÄTT</span>'
+            cls = "right"
+        elif verdict == "FEL":
+            badge = '<span class="badge badge-wrong">FEL</span>'
+            cls = "wrong"
+        else:
+            badge = '<span class="badge badge-unknown">OKLART</span>'
+            cls = "unknown"
 
-            html += f"""
+        commenter = row["commenter"] or "Okänd soffexpert"
+        claim_text = row["claim_text"] or ""
+        evidence = row["evidence"] or ""
+
+        html += f"""
 <div class="card claim {cls}" id="claim-{row['id']}">
 
 <div class="meta">
@@ -1744,224 +1320,23 @@ Visar {start_index + 1 if total_filtered else 0}–{min(end_index, total_filtere
 </p>
 """
 
-            if evidence:
-                html += f"""
+        if evidence:
+            html += f"""
 <p>
 <strong>Verkligheten:</strong><br>
 {escape(evidence)}
 </p>
 """
 
-            html += f"""
+        html += f"""
 <p class="meta">
 Påstående #{row['id']}
 </p>
 
-<p>
-<a class="button" href="{url_for('claim_detail', claim_id=row['id'])}">
-Visa påståendet
-</a>
-</p>
-
-</div>
-"""
-
-    if total_pages > 1:
-        html += """
-<div class="card" style="display:flex; justify-content:center; align-items:center; gap:8px; flex-wrap:wrap;">
-"""
-
-        if current_page > 1:
-            html += f"""
-<a class="button" href="{page_url(current_page - 1)}">← Föregående</a>
-"""
-
-        start_page = max(1, current_page - 2)
-        end_page_number = min(total_pages, current_page + 2)
-
-        if start_page > 1:
-            html += f'<a class="button" href="{page_url(1)}">1</a>'
-            if start_page > 2:
-                html += '<span class="meta" style="padding:10px 4px;">…</span>'
-
-        for number in range(start_page, end_page_number + 1):
-            if number == current_page:
-                html += f"""
-<span class="button" style="background:#555b61; cursor:default;">
-{number}
-</span>
-"""
-            else:
-                html += f"""
-<a class="button" href="{page_url(number)}">{number}</a>
-"""
-
-        if end_page_number < total_pages:
-            if end_page_number < total_pages - 1:
-                html += '<span class="meta" style="padding:10px 4px;">…</span>'
-            html += f'<a class="button" href="{page_url(total_pages)}">{total_pages}</a>'
-
-        if current_page < total_pages:
-            html += f"""
-<a class="button" href="{page_url(current_page + 1)}">Nästa →</a>
-"""
-
-        html += """
 </div>
 """
 
     return page("Påståenden", html)
-
-
-# ============================================================
-# ENSKILT PÅSTÅENDE
-# ============================================================
-
-@app.route("/claim/<int:claim_id>")
-def claim_detail(claim_id):
-    conn = get_db()
-    row = conn.execute("""
-        SELECT c.*, co.commenter, co.comment_text,
-               co.facebook_time AS source_time
-        FROM claims c
-        LEFT JOIN comments co ON c.comment_id = co.id
-        WHERE c.id = ?
-    """, (claim_id,)).fetchone()
-    conn.close()
-
-    if row is None:
-        return page("Påståendet hittades inte", '''
-<div class="card"><h2>Påståendet hittades inte.</h2></div>
-'''), 404
-
-    verdict = row["verdict"] or "OKLART"
-    if verdict == "RÄTT":
-        badge = '<span class="badge badge-right">RÄTT</span>'
-        cls = "right"
-    elif verdict == "FEL":
-        badge = '<span class="badge badge-wrong">FEL</span>'
-        cls = "wrong"
-    else:
-        badge = '<span class="badge badge-unknown">OKLART</span>'
-        cls = "unknown"
-
-    commenter = row["commenter"] or "Okänd soffexpert"
-    claim_text = row['claim_text'] or ""
-    evidence = row['evidence'] or ""
-
-    content = f'''
-<h1>Påstående #{row['id']}</h1>
-<div class="card claim {cls}">
-<div>{badge}</div>
-<h2>{escape(claim_text)}</h2>
-<p class="meta">Soffexpert:
-<a href="{url_for("expert", name=commenter)}">{escape(commenter)}</a></p>
-<p class="meta">{escape(claim_tag("", claim_text))}
- · {escape(season_from_date(row["source_time"]))}</p>
-'''
-
-    if row['comment_text']:
-        content += f'''
-<div class="comment">
-<strong>Originalkommentar:</strong>
-<p>{escape(row['comment_text'])}</p>
-</div>
-'''
-
-    if evidence:
-        content += f'''
-<p><strong>Verkligheten:</strong><br>{escape(evidence)}</p>
-'''
-
-    content += '</div>'
-    return page(f"Påstående #{row['id']}", content)
-
-
-# ============================================================
-# RANKING
-# ============================================================
-
-@app.route("/ranking")
-def ranking():
-    conn = get_db()
-    rows = conn.execute("""
-        SELECT c.verdict, co.commenter, co.facebook_time AS source_time
-        FROM claims c
-        LEFT JOIN comments co ON c.comment_id = co.id
-        WHERE co.commenter IS NOT NULL AND co.commenter != ''
-    """).fetchall()
-    conn.close()
-
-    season = request.args.get("season", "ALL").strip()
-    available_seasons = sorted(
-        {season_from_date(row["source_time"]) for row in rows},
-        reverse=True
-    )
-
-    if season not in available_seasons:
-        season = "ALL"
-
-    if season != "ALL":
-        rows = [row for row in rows
-                if season_from_date(row["source_time"]) == season]
-
-    ranked = ranking_stats(rows)
-
-    html = '''
-<h1>Ranking</h1>
-<div class="subtitle">Vem hade faktiskt rätt?</div>
-
-<div class="card">
-<form method="GET">
-<label for="ranking-season"><strong>Säsong</strong></label>
-<select id="ranking-season" name="season" style="width:100%; box-sizing:border-box; margin-top:8px; padding:10px; border-radius:8px; border:1px solid #444; background:#181818; color:#fff;">
-<option value="ALL">Alla säsonger</option>
-'''
-
-    for available in available_seasons:
-        selected = " selected" if season == available else ""
-        html += f'<option value="{escape(available)}"{selected}>{escape(available)}</option>'
-
-    html += '''
-</select>
-<div style="margin-top:15px;">
-<button type="submit">Visa ranking</button>
-<a class="button" href="/ranking">Rensa</a>
-</div>
-</form>
-</div>
-
-<div class="card">
-<p class="meta">
-Minst 3 avgjorda påståenden krävs. RÄTT ger 1 poäng.
-FEL ger 0. OKLART påverkar inte träffprocenten.
-</p>
-<table>
-<tr>
-<th>#</th><th>Soffexpert</th><th>Avgjorda</th>
-<th>Rätt</th><th>Fel</th><th>Träff</th><th>Poäng</th>
-</tr>
-'''
-
-    if not ranked:
-        html += '<tr><td colspan="7">Ingen har tillräckligt många avgjorda påståenden ännu.</td></tr>'
-
-    for position, item in enumerate(ranked, 1):
-        html += f'''
-<tr>
-<td><strong>{position}</strong></td>
-<td><a href="{url_for("expert", name=item["name"])}"><strong>{escape(item["name"])}</strong></a></td>
-<td>{item["claims"]}</td>
-<td>{item["right"]}</td>
-<td>{item["wrong"]}</td>
-<td><strong>{item["percentage"]} %</strong></td>
-<td>{item["points"]}</td>
-</tr>
-'''
-
-    html += '</table></div>'
-    return page("Ranking", html)
-
 
 # ============================================================
 # SOFFEXPERTER
@@ -2017,19 +1392,12 @@ Personerna bakom påståendena.
 <th>Påståenden</th>
 <th>Rätt</th>
 <th>Fel</th>
-<th>Träff</th>
 </tr>
 """
 
     for row in rows:
 
         name = row["commenter"]
-
-        claim_total = row["claims"] or 0
-        right_total = row["right_count"] or 0
-        wrong_total = row["wrong_count"] or 0
-        decided_total = right_total + wrong_total
-        percentage = round((right_total / decided_total) * 100) if decided_total else 0
 
         html += f"""
 <tr>
@@ -2041,10 +1409,9 @@ Personerna bakom påståendena.
 </td>
 
 <td>{row["comments"] or 0}</td>
-<td>{claim_total}</td>
-<td>{right_total}</td>
-<td>{wrong_total}</td>
-<td>{percentage} %</td>
+<td>{row["claims"] or 0}</td>
+<td>{row["right_count"] or 0}</td>
+<td>{row["wrong_count"] or 0}</td>
 
 </tr>
 """
@@ -2104,7 +1471,7 @@ Soffexpertprofil
 
     claim_rows = [
         row for row in rows
-        if row['id'] is not None
+        if row["id"] is not None
     ]
 
     right = sum(
@@ -2163,7 +1530,7 @@ Soffexpertprofil
 
     for row in rows:
 
-        if row['id'] is None:
+        if row["id"] is None:
 
             html += f"""
 <div class="card">
@@ -2173,7 +1540,7 @@ Kommentar
 </div>
 
 <p>
-{escape(row['comment_text'])}
+{escape(row["comment_text"])}
 </p>
 """
 
@@ -2212,7 +1579,7 @@ Kommentar
 {badge}
 
 <h3>
-{escape(row['claim_text'])}
+{escape(row["claim_text"])}
 </h3>
 
 <div class="comment">
@@ -2220,24 +1587,24 @@ Kommentar
 <strong>Originalkommentar:</strong>
 
 <p>
-{escape(row['comment_text'])}
+{escape(row["comment_text"])}
 </p>
 
 </div>
 """
 
-        if row['evidence']:
+        if row["evidence"]:
 
             html += f"""
 <p>
 <strong>Vad som faktiskt hände:</strong><br>
-{escape(row['evidence'])}
+{escape(row["evidence"])}
 </p>
 """
 
         html += f"""
 <div class="meta">
-Påstående #{row['id']}
+Påstående #{row["id"]}
 </div>
 
 </div>
@@ -2272,11 +1639,7 @@ def forum():
             ""
         ).strip()
 
-        edit_token = ""
-
         if username and title and message:
-
-            edit_token = secrets.token_urlsafe(32)
 
             conn.execute("""
                 INSERT INTO forum_threads
@@ -2284,29 +1647,23 @@ def forum():
                     title,
                     username,
                     message,
-                    created_at,
-                    edit_token
+                    created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?)
             """, (
                 username,
                 title,
                 message,
                 datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S"
-                ),
-                edit_token
+                )
             ))
 
             conn.commit()
-            remember_forum_token("forum_thread", conn.execute("SELECT last_insert_rowid()").fetchone()[0], edit_token)
 
         conn.close()
 
-        response = redirect(url_for("forum"))
-        if edit_token:
-            set_forum_token(response, edit_token)
-        return response
+        return redirect(url_for("forum"))
 
     threads = conn.execute("""
         SELECT *
@@ -2350,7 +1707,6 @@ Diskutera Djurgården och SOFFEXPERTERNA.
 <label>Meddelande</label>
 
 <textarea
-    id="new-thread-message"
     name="message"
     rows="5"
     maxlength="2000"
@@ -2373,16 +1729,16 @@ Starta tråd
 
 <h2>
 <a href="{url_for('forum_thread', thread_id=thread['id'])}">
-{escape(thread['title'])}
+{escape(thread["title"])}
 </a>
 </h2>
 
 <p>
-{escape(thread['message'])}
+{escape(thread["message"])}
 </p>
 
 <div class="meta">
-{escape(thread['username'])} · {escape(thread['created_at'])}
+{escape(thread["username"])} · {escape(thread["created_at"])}
 </div>
 
 </div>
@@ -2436,16 +1792,19 @@ def edit_thread(thread_id):
             ""
         ).strip()
 
-        if not can_manage_forum_item(thread):
+        if username != thread["username"]:
 
             conn.close()
 
             return page(
-                "Ingen behörighet",
+                "Fel användarnamn",
                 """
                 <div class="card">
-                <h2>Ingen behörighet</h2>
-                <p>Du har inte behörighet att ändra detta inlägg.</p>
+                <h2>Fel användarnamn</h2>
+                <p>
+                Använd samma användarnamn som användes när
+                tråden skapades.
+                </p>
                 </div>
                 """
             ), 403
@@ -2495,7 +1854,7 @@ def edit_thread(thread_id):
     type="text"
     name="title"
     maxlength="120"
-    value="{escape(thread['title'])}"
+    value="{escape(thread["title"])}"
     required
 >
 
@@ -2506,7 +1865,7 @@ def edit_thread(thread_id):
     rows="7"
     maxlength="2000"
     required
->{escape(thread['message'])}</textarea>
+>{escape(thread["message"])}</textarea>
 
 <button type="submit">
 Spara ändringar
@@ -2546,16 +1905,23 @@ def delete_thread(thread_id):
 
         return redirect(url_for("forum"))
 
-    if not can_manage_forum_item(thread):
+    username = request.form.get(
+        "username",
+        ""
+    ).strip()
+
+    if username != thread["username"]:
 
         conn.close()
 
         return page(
-            "Ingen behörighet",
+            "Fel användarnamn",
             """
             <div class="card">
-            <h2>Ingen behörighet</h2>
-            <p>Du har inte behörighet att ändra detta inlägg.</p>
+            <h2>Fel användarnamn</h2>
+            <p>
+            Tråden kunde inte tas bort.
+            </p>
             </div>
             """
         ), 403
@@ -2619,11 +1985,7 @@ def forum_thread(thread_id):
             ""
         ).strip()
 
-        edit_token = ""
-
         if username and message:
-
-            edit_token = secrets.token_urlsafe(32)
 
             conn.execute("""
                 INSERT INTO forum_replies
@@ -2631,34 +1993,28 @@ def forum_thread(thread_id):
                     thread_id,
                     username,
                     message,
-                    created_at,
-                    edit_token
+                    created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?)
             """, (
                 thread_id,
                 username,
                 message,
                 datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S"
-                ),
-                edit_token
+                )
             ))
 
             conn.commit()
-            remember_forum_token("forum_reply", conn.execute("SELECT last_insert_rowid()").fetchone()[0], edit_token)
 
         conn.close()
 
-        response = redirect(
+        return redirect(
             url_for(
                 "forum_thread",
                 thread_id=thread_id
             )
         )
-        if edit_token:
-            set_forum_token(response, edit_token)
-        return response
 
     replies = conn.execute("""
         SELECT *
@@ -2670,30 +2026,20 @@ def forum_thread(thread_id):
     conn.close()
 
     content = f"""
-<h1>{escape(thread['title'])}</h1>
+<h1>{escape(thread["title"])}</h1>
 
 <div class="card">
 
 <p>
-{escape(thread['message'])}
+{escape(thread["message"])}
 </p>
 
 <div class="meta">
-Startad av {escape(thread['username'])}
-· {escape(thread['created_at'])}
+Startad av {escape(thread["username"])}
+· {escape(thread["created_at"])}
 </div>
 
 <div class="forum-actions">
-
-<button
-    type="button"
-    class="small"
-    onclick="window.citera(this)"
-    data-username="{escape(thread['username'])}"
-    data-message="{escape(thread['message'])}"
->
-Citera
-</button>
 
 <a href="{url_for('edit_thread', thread_id=thread_id)}">
 <button type="button" class="small">
@@ -2706,6 +2052,15 @@ Redigera tråd
     method="POST"
     action="{url_for('delete_thread', thread_id=thread_id)}"
     onsubmit="return confirm('Vill du verkligen ta bort hela tråden? Alla svar tas också bort.');"
+>
+
+<input
+    type="text"
+    name="username"
+    placeholder="Ditt användarnamn"
+    maxlength="40"
+    required
+    style="width:180px;margin:0 5px 0 0;"
 >
 
 <button
@@ -2740,24 +2095,14 @@ Inga svar ännu.
 <div class="card">
 
 <p>
-{escape(reply['message'])}
+{escape(reply["message"])}
 </p>
 
 <div class="meta">
-{escape(reply['username'])} · {escape(reply['created_at'])}
+{escape(reply["username"])} · {escape(reply["created_at"])}
 </div>
 
 <div class="forum-actions">
-
-<button
-    type="button"
-    class="small"
-    onclick="window.citera(this)"
-    data-username="{escape(reply['username'])}"
-    data-message="{escape(reply['message'])}"
->
-Citera
-</button>
 
 <a href="{url_for('edit_reply', reply_id=reply['id'])}">
 <button type="button" class="small">
@@ -2770,6 +2115,15 @@ Redigera
     method="POST"
     action="{url_for('delete_reply', reply_id=reply['id'])}"
     onsubmit="return confirm('Vill du verkligen ta bort detta svar?');"
+>
+
+<input
+    type="text"
+    name="username"
+    placeholder="Ditt användarnamn"
+    maxlength="40"
+    required
+    style="width:180px;margin:0 5px 0 0;"
 >
 
 <button
@@ -2798,14 +2152,13 @@ Ta bort
 <input
     type="text"
     name="username"
-    maxlength="80"
+    maxlength="40"
     required
 >
 
 <label>Meddelande</label>
 
 <textarea
-    id="reply-message"
     name="message"
     rows="5"
     maxlength="2000"
@@ -2818,39 +2171,11 @@ Svara
 
 </form>
 
-<script>
-window.citera = function(button) {
-    const username = button.getAttribute("data-username") || "";
-    const message = button.getAttribute("data-message") || "";
-    const textarea = document.getElementById("reply-message");
-
-    if (!textarea) {
-        alert("Svarsrutan kunde inte hittas.");
-        return;
-    }
-
-    const lines = message.split(/\r?\n/);
-    const quote = "> " + username + " skrev:\n" +
-        lines.map(function(line) { return "> " + line; }).join("\n") +
-        "\n\n";
-
-    if (textarea.value.trim()) {
-        textarea.value += "\n" + quote;
-    } else {
-        textarea.value = quote;
-    }
-
-    textarea.focus();
-    textarea.selectionStart = textarea.value.length;
-    textarea.selectionEnd = textarea.value.length;
-};
-</script>
-
 </div>
 """
 
     return page(
-        thread['title'],
+        thread["title"],
         content
     )
 
@@ -2898,16 +2223,19 @@ def edit_reply(reply_id):
             ""
         ).strip()
 
-        if not can_manage_forum_item(reply):
+        if username != reply["username"]:
 
             conn.close()
 
             return page(
-                "Ingen behörighet",
+                "Fel användarnamn",
                 """
                 <div class="card">
-                <h2>Ingen behörighet</h2>
-                <p>Du har inte behörighet att ändra detta inlägg.</p>
+                <h2>Fel användarnamn</h2>
+                <p>
+                Använd samma användarnamn som användes
+                när svaret skapades.
+                </p>
                 </div>
                 """
             ), 403
@@ -2959,7 +2287,7 @@ def edit_reply(reply_id):
     rows="7"
     maxlength="2000"
     required
->{escape(reply['message'])}</textarea>
+>{escape(reply["message"])}</textarea>
 
 <button type="submit">
 Spara ändringar
@@ -2999,16 +2327,23 @@ def delete_reply(reply_id):
 
         return redirect(url_for("forum"))
 
-    if not can_manage_forum_item(reply):
+    username = request.form.get(
+        "username",
+        ""
+    ).strip()
+
+    if username != reply["username"]:
 
         conn.close()
 
         return page(
-            "Ingen behörighet",
+            "Fel användarnamn",
             """
             <div class="card">
-            <h2>Ingen behörighet</h2>
-            <p>Du har inte behörighet att ändra detta inlägg.</p>
+            <h2>Fel användarnamn</h2>
+            <p>
+            Svaret kunde inte tas bort.
+            </p>
             </div>
             """
         ), 403
