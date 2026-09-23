@@ -12,7 +12,8 @@ MAX_DAGAR = 28
 
 KALLOR = [
     ("Djurgården Hockey", "https://www.facebook.com/difhockeyse"),
-    ("TV4 Hockey", "https://www.facebook.com/tv4hockey")
+    ("TV4 Hockey", "https://www.facebook.com/tv4hockey"),
+    ("HockeyNews.se", "https://www.facebook.com/hockeynews.se")
 ]
 
 MANADER = {

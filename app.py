@@ -10,13 +10,6 @@ from functools import wraps
 app = Flask(__name__)
 
 DB = "dif_hockey.db"
-SEED_DB = "render_seed.sqlite"
-
-def ensure_database():
-    if not __import__("os").path.exists(DB) and __import__("os").path.exists(SEED_DB):
-        __import__("shutil").copyfile(SEED_DB, DB)
-
-ensure_database()
 
 
 # ============================================================
